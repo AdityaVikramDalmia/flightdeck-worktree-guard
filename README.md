@@ -7,7 +7,9 @@ merging a branch. Exit codes and JSON output make the checks usable from shell
 scripts, coding agents, and CI. The tool performs checks only; it never merges,
 removes worktrees, deletes branches, or fetches from a remote.
 
-Requires Python 3.8+ and Git with `worktree list --porcelain -z` support.
+Requires Python 3.8+ and Git 2.36+ with `worktree list --porcelain -z` support.
+The Git floor also ensures `core.fsmonitor=false` disables the monitor rather
+than being interpreted as a hook pathname by older versions.
 
 ```sh
 make test
@@ -17,6 +19,16 @@ worktree-guard merge-check . --base main --branch feature --json
 ```
 
 You can also run `./bin/worktree-guard` directly without installing anything.
+
+Split-index mode is unsupported for read-only inspection: Git can refresh
+`sharedindex.*` timestamps even when optional locks are disabled. Before reading
+an index, the guard returns error 2 if `core.splitIndex=true` or if the inspected
+worktree/common Git administration directories contain any `sharedindex.*` entry.
+The same boundary applies to initialized submodules before parent status inspects them.
+This deliberately also refuses leftover shared-index artifacts after conversion
+to a normal index. Setting `core.splitIndex=false` alone does not remove that
+boundary. Use a separate checkout with a normal index and no such artifacts;
+the guard never converts an index or removes Git files for you.
 
 Removal checks require a registered, unlocked linked worktree, no unfinished Git
 operation, no tracked changes or untracked files, no index flags that conceal

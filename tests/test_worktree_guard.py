@@ -252,6 +252,90 @@ class WorktreeGuardTests(unittest.TestCase):
         self.assertEqual(self.check()[0], 0)
         self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
 
+    def split_index_files(self, path):
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir", cwd=path))
+        shared = list(gitdir.glob("sharedindex.*"))
+        self.assertTrue(shared, "real split-index setup must produce a shared index")
+        for file in shared:
+            os.utime(file, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+        return [gitdir / "index", *shared]
+
+    def assert_index_files_unchanged(self, files, before):
+        self.assertEqual({str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in files}, before)
+
+    def test_active_split_index_remove_check_never_touches_shared_mtimes(self):
+        self.git("update-index", "--split-index", cwd=self.lane)
+        for setting in ("true", "false"):
+            with self.subTest(core_split_index=setting):
+                self.git("config", "core.splitIndex", setting, cwd=self.lane)
+                files = self.split_index_files(self.lane)
+                before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in files}
+                code, result = self.check()
+                self.assertEqual(code, 2)
+                self.assertEqual(result["status"], "error")
+                self.assertIn("split-index", result["error"])
+                self.assert_index_files_unchanged(files, before)
+
+    def test_active_split_index_merge_check_never_touches_shared_mtimes(self):
+        self.commit_lane()
+        self.git("update-index", "--split-index", cwd=self.repo)
+        self.git("config", "core.splitIndex", "false", cwd=self.repo)
+        files = self.split_index_files(self.repo)
+        before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in files}
+        code, result = self.check("merge-check", self.repo, "--branch", "task")
+        self.assertEqual(code, 2)
+        self.assertIn("split-index", result["error"])
+        self.assert_index_files_unchanged(files, before)
+
+    def test_configured_split_index_is_refused_before_artifact_creation(self):
+        self.git("config", "core.splitIndex", "true", cwd=self.lane)
+        gitdir = Path(self.git("rev-parse", "--absolute-git-dir", cwd=self.lane))
+        self.assertEqual(list(gitdir.glob("sharedindex.*")), [])
+        index = gitdir / "index"
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+        code, result = self.check()
+        self.assertEqual(code, 2)
+        self.assertIn("split-index", result["error"])
+        self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
+        self.assertEqual(list(gitdir.glob("sharedindex.*")), [])
+
+    def test_submodule_split_index_is_detected_before_parent_status(self):
+        module = self.make_submodule()
+        self.git("update-index", "--split-index", cwd=module)
+        self.git("config", "core.splitIndex", "false", cwd=module)
+        files = self.split_index_files(module)
+        before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in files}
+        code, result = self.check()
+        self.assertEqual(code, 2)
+        self.assertIn("split-index", result["error"])
+        self.assert_index_files_unchanged(files, before)
+
+    def test_nested_submodule_split_index_preserves_shared_mtimes(self):
+        module = self.make_submodule()
+        self.git("-c", "protocol.file.allow=always", "submodule", "add",
+                 str(self.root / "module source"), "nested", cwd=module)
+        nested = module / "nested"
+        self.git("update-index", "--split-index", cwd=nested)
+        self.git("config", "core.splitIndex", "false", cwd=nested)
+        files = self.split_index_files(nested)
+        before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in files}
+        code, result = self.check()
+        self.assertEqual(code, 2)
+        self.assertIn("initialized submodule", result["error"])
+        self.assertIn("split-index", result["error"])
+        self.assert_index_files_unchanged(files, before)
+
+    def test_stale_shared_index_artifacts_are_conservatively_refused(self):
+        self.git("update-index", "--split-index", cwd=self.lane)
+        self.git("update-index", "--no-split-index", cwd=self.lane)
+        self.git("config", "core.splitIndex", "false", cwd=self.lane)
+        files = self.split_index_files(self.lane)
+        before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in files}
+        code, result = self.check()
+        self.assertEqual(code, 2)
+        self.assertIn("sharedindex.* artifacts", result["error"])
+        self.assert_index_files_unchanged(files, before)
+
     def test_sequencer_state_blocks_removal(self):
         folder = Path(self.git("rev-parse", "--git-path", "sequencer", cwd=self.lane))
         folder.mkdir()

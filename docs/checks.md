@@ -47,3 +47,22 @@ Inspection consists of multiple Git calls. Concurrent changes can make their
 observations inconsistent, even before the process prints its verdict. Stop writers
 throughout inspection and the subsequent operation. The tool holds no transaction
 lock and cannot prove that a later merge or removal will be safe.
+
+## Split-index boundary
+
+Git's nominally read-only index commands can update a shared index's mtime even
+with `GIT_OPTIONAL_LOCKS=0`. The guard therefore checks configuration and directory
+entry names before any index-reading command, including `status` or `ls-files`.
+It does not use `rev-parse --shared-index-path`, which itself can read the index.
+
+`core.splitIndex=true`, or any `sharedindex.*` entry in the inspected worktree or
+common Git administrative directory, makes inspection unsupported (error 2).
+Initialized submodules, including nested modules, receive the same check before
+parent status can inspect their indexes. Their paths come from each already-checked
+parent index. This preflight checks at most 128 repository paths including the
+requested worktree; larger initialized-submodule sets return error 2. Revisited
+Git directories are not traversed again. Existing split indexes remain unsupported even if configuration says false.
+Leftover shared-index files can cause the same conservative refusal after an
+index was converted. The tool does not parse Git's binary index, infer whether
+artifacts are orphaned, or delete them. Use a separate ordinary-index checkout.
+This boundary assumes writers are stopped, like the other preflight observations.

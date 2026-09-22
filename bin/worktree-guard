@@ -28,9 +28,52 @@ class Repository:
         self.gitdir = Path(self.text("rev-parse", "--absolute-git-dir")).resolve()
         common = Path(self.text("rev-parse", "--git-common-dir"))
         self.common = (common if common.is_absolute() else self.path / common).resolve()
+        self.reject_split_index()
         grafts = self.common / "info" / "grafts"
         if grafts.exists() and grafts.stat().st_size:
             raise CheckError("legacy info/grafts rewrites ancestry; remove it before checking")
+
+    def reject_split_index(self):
+        # Even status/ls-files with GIT_OPTIONAL_LOCKS=0 can refresh a shared
+        # index file's mtime. Detect the conservative unsupported boundary using
+        # configuration and directory names only, before Git reads any index.
+        # rev-parse --shared-index-path is NOT safe for this purpose.
+        configured = self.text("config", "--bool", "--get", "core.splitIndex", allowed=(0, 1))
+        artifacts = any(entry.name.startswith("sharedindex.")
+                        for directory in {self.gitdir, self.common}
+                        for entry in directory.iterdir())
+        if configured == "true" or artifacts:
+            raise CheckError(
+                "split-index configuration or sharedindex.* artifacts are unsupported for read-only inspection; "
+                "Git can update shared-index timestamps even with optional locks disabled. "
+                "Use a checkout with a normal index and no shared-index artifacts; "
+                "disabling core.splitIndex alone does not establish that boundary."
+            )
+
+    def reject_split_submodule_indexes(self):
+        # Parent status inspects initialized submodules despite recurse=false.
+        # Only read each index after its Repository constructor checked the same
+        # split-index boundary; walk nested modules before running parent status.
+        pending = [self]
+        visited = set()
+        inspected = 1
+        while pending:
+            repository = pending.pop()
+            if repository.gitdir in visited:
+                continue
+            visited.add(repository.gitdir)
+            for item in repository.run("ls-files", "--stage", "-z").stdout.split(b"\0"):
+                if item.startswith(b"160000 ") and b"\t" in item:
+                    relative = os.fsdecode(item.split(b"\t", 1)[1])
+                    child = repository.top / relative
+                    if (child / ".git").exists():
+                        if inspected >= 128:
+                            raise CheckError("initialized submodule preflight exceeds 128 repository paths; inspection unsupported")
+                        inspected += 1
+                        try:
+                            pending.append(Repository(child))
+                        except CheckError as exc:
+                            raise CheckError("initialized submodule " + str(child) + ": " + str(exc)) from exc
 
     def run(self, *args, allowed=(0,)):
         try:
@@ -112,6 +155,7 @@ def refuse(result, code, message):
 
 
 def common_checks(repo, result, allow_ignored):
+    repo.reject_split_submodule_indexes()
     if repo.path != repo.top:
         refuse(result, "not_worktree_root", "Pass the worktree root, not a subdirectory.")
     unchecked = []
