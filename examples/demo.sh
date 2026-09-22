@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Deprecated reference example for new Claude Code integrations (2026-09-22).
 set -eu
 tool="$(cd "$(dirname "$0")/../bin" && pwd)/worktree-guard"
 demo_dir="$(mktemp -d "${TMPDIR:-/tmp}/worktree-guard-demo.XXXXXX")"
