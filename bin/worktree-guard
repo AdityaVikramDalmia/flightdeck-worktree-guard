@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Read-only checks before removing a linked Git worktree or merging a branch."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+VERSION = "0.1.0"
+
+
+class CheckError(Exception):
+    pass
+
+
+class Repository:
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        if not self.path.is_dir():
+            raise CheckError("directory does not exist: " + str(self.path))
+        # Caller-side Git overrides must not redirect inspection to a different repo.
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        self.env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
+                        GIT_NO_REPLACE_OBJECTS="1", LC_ALL="C")
+        self.top = Path(self.text("rev-parse", "--show-toplevel")).resolve()
+        self.gitdir = Path(self.text("rev-parse", "--absolute-git-dir")).resolve()
+        common = Path(self.text("rev-parse", "--git-common-dir"))
+        self.common = (common if common.is_absolute() else self.path / common).resolve()
+        grafts = self.common / "info" / "grafts"
+        if grafts.exists() and grafts.stat().st_size:
+            raise CheckError("legacy info/grafts rewrites ancestry; remove it before checking")
+
+    def run(self, *args, allowed=(0,)):
+        try:
+            result = subprocess.run(
+                ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                 "-c", "submodule.recurse=false", "-C", str(self.path), *args],
+                env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+        except OSError as exc:
+            raise CheckError("cannot run git: " + str(exc)) from exc
+        if result.returncode not in allowed:
+            detail = os.fsdecode(result.stderr).strip()
+            raise CheckError("git " + args[0] + " failed" + (": " + detail if detail else ""))
+        return result
+
+    def text(self, *args, allowed=(0,)):
+        raw = self.run(*args, allowed=allowed).stdout
+        # Git appends one record terminator; newlines may also belong to paths.
+        return os.fsdecode(raw[:-1] if raw.endswith(b"\n") else raw)
+
+    def head(self):
+        return self.text("rev-parse", "--verify", "HEAD^{commit}")
+
+    def branch(self):
+        return self.text("symbolic-ref", "--quiet", "HEAD", allowed=(0, 1)) or None
+
+    def base(self, value):
+        ref = self.text("rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", value)
+        if not ref.startswith(("refs/heads/", "refs/remotes/")):
+            raise CheckError("--base must name a local or remote-tracking branch")
+        commit = self.text("rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
+        return ref, commit
+
+    def status(self):
+        raw = self.run("status", "--porcelain=v1", "-z", "--untracked-files=all",
+                       "--ignored=matching", "--ignore-submodules=none").stdout
+        if raw and not raw.endswith(b"\0"):
+            raise CheckError("unterminated git status output")
+        records = raw.split(b"\0")
+        entries = []
+        index = 0
+        while index < len(records):
+            item = records[index]
+            index += 1
+            if not item:
+                continue
+            if len(item) < 4 or item[2:3] != b" ":
+                raise CheckError("unrecognized git status record")
+            code = item[:2].decode("ascii")
+            row = {"code": code, "path": os.fsdecode(item[3:])}
+            if "R" in code or "C" in code:
+                if index >= len(records) or not records[index]:
+                    raise CheckError("incomplete rename/copy status record")
+                row["source"] = os.fsdecode(records[index])
+                index += 1
+            entries.append(row)
+        return entries
+
+    def worktrees(self):
+        raw = self.run("worktree", "list", "--porcelain", "-z").stdout
+        rows = []
+        row = {}
+        for item in raw.split(b"\0"):
+            if not item:
+                if row:
+                    rows.append(row)
+                    row = {}
+                continue
+            key, _, value = os.fsdecode(item).partition(" ")
+            row[key] = value
+        if row:
+            rows.append(row)
+        return rows
+
+
+def refuse(result, code, message):
+    result["reasons"].append({"code": code, "message": message})
+
+
+def common_checks(repo, result, allow_ignored):
+    if repo.path != repo.top:
+        refuse(result, "not_worktree_root", "Pass the worktree root, not a subdirectory.")
+    unchecked = []
+    for item in repo.run("ls-files", "-v", "-z").stdout.split(b"\0"):
+        if not item:
+            continue
+        if len(item) < 3 or item[1:2] != b" " or item[:1] not in b"HSMRCK?hsmrck":
+            raise CheckError("unrecognized git index flag record")
+        if item[:1].islower() or item[:1] == b"S":
+            unchecked.append(os.fsdecode(item[2:]))
+    result["unchecked_index_entries"] = unchecked
+    if unchecked:
+        refuse(result, "unchecked_index_entries",
+               "Assume-unchanged or skip-worktree entries can conceal tracked edits; clear those flags and inspect first.")
+    status = repo.status()
+    result["changes"] = status
+    dirty = [row for row in status if row["code"] != "!!"]
+    ignored = [row for row in status if row["code"] == "!!"]
+    if dirty:
+        refuse(result, "dirty", "Tracked changes or untracked files are present.")
+    if ignored and not allow_ignored:
+        refuse(result, "ignored_files", "Ignored files are present; inspect them before allowing their loss.")
+    for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply", "sequencer"):
+        path = Path(repo.text("rev-parse", "--git-path", name))
+        if not path.is_absolute():
+            path = repo.path / path
+        if path.exists():
+            refuse(result, "operation_in_progress", "Git operation state exists: " + name)
+
+
+def remove_check(args):
+    repo = Repository(args.path)
+    base_ref, base_commit = repo.base(args.base)
+    result = {"operation": "remove-check", "path": str(repo.top), "head": repo.head(),
+              "branch": repo.branch(), "base_ref": base_ref, "base_commit": base_commit,
+              "allow_ignored": args.allow_ignored, "reasons": []}
+    common_checks(repo, result, args.allow_ignored)
+    if repo.gitdir == repo.common:
+        refuse(result, "main_worktree", "The main working tree cannot be removed with this check.")
+    matches = [row for row in repo.worktrees()
+               if "worktree" in row and Path(row["worktree"]).resolve() == repo.top]
+    if len(matches) != 1:
+        refuse(result, "unregistered_worktree", "The path is not exactly one registered worktree.")
+    else:
+        for key in ("locked", "prunable"):
+            if key in matches[0]:
+                refuse(result, key, "Worktree is " + key + (": " + matches[0][key] if matches[0][key] else "."))
+    if result["branch"] == base_ref:
+        refuse(result, "self_base", "The candidate's own branch cannot establish a separate retained base.")
+    ancestry = repo.run("merge-base", "--is-ancestor", result["head"], base_commit, allowed=(0, 1))
+    result["merged"] = ancestry.returncode == 0
+    if not result["merged"]:
+        refuse(result, "unmerged", "Candidate HEAD is not an ancestor of the selected base.")
+    # Git itself refuses ordinary removal of a worktree containing initialized submodules.
+    initialized = []
+    for item in repo.run("ls-files", "--stage", "-z").stdout.split(b"\0"):
+        if item.startswith(b"160000 ") and b"\t" in item:
+            path = os.fsdecode(item.split(b"\t", 1)[1])
+            if (repo.top / path / ".git").exists():
+                initialized.append(path)
+    result["initialized_submodules"] = initialized
+    if initialized:
+        refuse(result, "initialized_submodules", "Initialized submodules require separate handling.")
+    return result
+
+
+def merge_check(args):
+    repo = Repository(args.path)
+    base_ref, base_commit = repo.base(args.base)
+    if not args.branch or args.branch.startswith("-"):
+        raise CheckError("--branch must name a local branch")
+    incoming_ref = "refs/heads/" + args.branch
+    repo.run("check-ref-format", incoming_ref)
+    incoming = repo.text("rev-parse", "--verify", "--end-of-options", incoming_ref + "^{commit}")
+    result = {"operation": "merge-check", "path": str(repo.top), "head": repo.head(),
+              "branch": repo.branch(), "base_ref": base_ref, "base_commit": base_commit,
+              "incoming_ref": incoming_ref, "incoming_commit": incoming,
+              "allow_ignored": args.allow_ignored, "reasons": []}
+    common_checks(repo, result, args.allow_ignored)
+    if repo.gitdir != repo.common:
+        refuse(result, "linked_worktree", "Perform the merge from the main working tree.")
+    if result["branch"] != base_ref:
+        refuse(result, "wrong_branch", "The checked-out branch is not the selected base.")
+    if incoming_ref == result["branch"]:
+        refuse(result, "self_merge", "A branch cannot be merged into itself.")
+    elif repo.run("merge-base", "--is-ancestor", incoming, result["head"], allowed=(0, 1)).returncode == 0:
+        refuse(result, "already_merged", "The incoming branch is already an ancestor of HEAD.")
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="worktree-guard " + VERSION)
+    sub = parser.add_subparsers(dest="operation", required=True)
+    for name, help_text in (("remove-check", "Check whether a linked worktree is safe to remove."),
+                            ("merge-check", "Check the location and inputs before a merge.")):
+        command = sub.add_parser(name, help=help_text)
+        command.add_argument("path", help="Worktree root to inspect.")
+        command.add_argument("--base", default="main", help="Retained base branch (default: main).")
+        command.add_argument("--allow-ignored", action="store_true", help="Allow ignored files after inspecting them.")
+        command.add_argument("--json", action="store_true", help="Emit a structured result.")
+        if name == "merge-check":
+            command.add_argument("--branch", required=True, help="Incoming local branch name.")
+    args = parser.parse_args(argv)
+    try:
+        result = remove_check(args) if args.operation == "remove-check" else merge_check(args)
+        result["status"] = "refused" if result["reasons"] else "ready"
+        code = 3 if result["reasons"] else 0
+    except (CheckError, OSError, UnicodeError, ValueError) as exc:
+        result = {"operation": args.operation, "status": "error", "error": str(exc)}
+        code = 2
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    elif code == 2:
+        print("ERROR: " + result["error"], file=sys.stderr)
+    else:
+        print(result["status"].upper() + ": " + result["path"])
+        for reason in result["reasons"]:
+            print("  " + reason["code"] + ": " + reason["message"])
+        if result["changes"]:
+            for item in result["changes"]:
+                print("  " + item["code"] + " " + json.dumps(item["path"]))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
