@@ -33,7 +33,7 @@ Requires Python 3.8+ and Git 2.36+ with `worktree list --porcelain -z` support.
 The Git floor also ensures `core.fsmonitor=false` disables the monitor rather
 than being interpreted as a hook pathname by older versions.
 
-Install the `worktree-guard` command with pipx:
+Install the `worktree-guard` command with pipx (the pipx route needs Python 3.9+):
 
 ```sh
 pipx install git+https://github.com/AdityaVikramDalmia/flightdeck-worktree-guard
