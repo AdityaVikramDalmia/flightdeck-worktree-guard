@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flightdeck-worktree-guard"
+version = "0.1.0"
+description = "Read-only checks before removing a linked Git worktree or merging a branch."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+
+[tool.setuptools]
+packages = []
+py-modules = []
+script-files = ["bin/worktree-guard"]
